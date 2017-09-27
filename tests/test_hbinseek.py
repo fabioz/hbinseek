@@ -11,7 +11,7 @@ def test_hbinseek(tmpdir):
     import numpy
     import pytest
 
-    filename = os.path.join(str(tmpdir), 'check.hbinseek')
+    filename = os.path.join(str(tmpdir), 'check.hbin')
     with hbinseek.open(filename, 'w') as f:
         group = f.create_group('/A/B')
         assert group.name == 'B'
@@ -38,11 +38,12 @@ def test_hbinseek(tmpdir):
         array = group.get_array('arr1')
         assert array.name == 'arr1'
         assert array.record_offset == 14
-        assert array.data_offset == 53
+        assert array.data_offset == 57
         assert array.dtype == numpy.int16
 
-    # print(open(filename).read())
-    # print(open(filename + '.binseekbin').read())
+#     print(open(f.filename).read())
+#     print(open(f.binary_data_filename).read())
+#     print(open(f.log_filename).read())
 
     with hbinseek.open(filename, 'r') as f:
         groups = f.list_groups()
@@ -57,7 +58,7 @@ def test_hbinseek(tmpdir):
         array = groupb.get_array('arr1')
         assert array.name == 'arr1'
         assert array.record_offset == 14
-        assert array.data_offset == 53
+        assert array.data_offset == 57
         assert array.dtype == numpy.int16
 
         read = array.read_numpy()
@@ -65,9 +66,42 @@ def test_hbinseek(tmpdir):
 
         array = groupb.get_array('arr2')
         assert array.name == 'arr2'
-        assert array.record_offset == 59
-        assert array.data_offset == 102
+        assert array.record_offset == 63
+        assert array.data_offset == 110
         assert array.dtype == numpy.int32
 
         read = array.read_numpy()
         assert numpy.array_equal(read, arr2)
+
+
+def test_hbinseek_manual_flush(tmpdir):
+    import hbinseek
+    import os
+    filename = os.path.join(str(tmpdir), 'check.hbinseek')
+    with hbinseek.open(filename, 'w', autoflush=False) as f:
+        group = f.create_group('/A')
+        assert group.name == 'A'
+
+        assert f.dirty
+
+        with hbinseek.open(filename, 'r') as read:
+            assert len(read.list_groups()) == 0
+
+        f.flush()
+        assert not f.dirty
+
+        with hbinseek.open(filename, 'r') as read:
+            assert len(read.list_groups()) == 1
+
+
+def test_hbinseek_restore_metadata_from_log(tmpdir):
+    import hbinseek
+    import os
+    filename = os.path.join(str(tmpdir), 'check.hbinseek')
+    with hbinseek.open(filename, 'w', autoflush=True, write_metadata=False) as f:
+        group = f.create_group('/A')
+        group.set_attr('unicode', 'a')
+        group.set_attr('bytes', b'a')
+        group.set_attr('int', 1)
+        group.set_attr('long', 2**32)
+        group.set_attr('float', 1.5)

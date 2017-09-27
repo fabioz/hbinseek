@@ -1,4 +1,6 @@
 '''
+Important: hbinseek is currently in development mode (so, don't use it just yet).
+
 hbinseek is a library which proposes a file format for dealing with binary data.
 
 The format is a hierarchical format which defines a hierarchy of groups with metadata (much like the
@@ -10,9 +12,9 @@ last one a log (which can be used to regenerate the metadata, much like an actua
 The design is so that adding data to the file is extremely fast (i.e.: binary data is appended to the
 binary file and the related info is added to the log file and metadata -- it's also possible to
 just skip writing the metadata completely and just recreate it from the log later on so that opening
-on a write is even faster -- reading it later on to read data may be a bit slower to recompute the
+for a write is even faster -- reading it later on to read data may be a bit slower to recompute the
 needed data, but it can benefit scenarios such as a simulator which just dumps information
-from time to time).
+from time to time without having to redump a full json for the metadata at each step).
 
 The design also allows opening a file for reading while another file writes it and working with
 incomplete data (everything written up to a point should be consistent).
@@ -26,7 +28,9 @@ log file: records file
 binary data: arrays dumped
 
 API notes:
-All names (group, array) should be received/handled as unicode and saved as utf-8 internally.
+
+All names (group, array) should be received/handled as unicode (in py2 or str in py3) and 
+saved as utf-8 internally.
 
 
 Current state:
@@ -58,9 +62,17 @@ PY3_ONWARDS = sys.version_info[0] >= 3
 
 if PY3_ONWARDS:
     VALID_ATTR_TYPES = (int, float, str, bytes)
+    # Alias for backward-compatibility (open is redefined in this module).
     file = open
+    text_type = str
 else:
     VALID_ATTR_TYPES = (int, long, float, unicode, bytes)
+    text_type = unicode
+
+PACK_UNSIGNED_LONG = '<L'  # < means we're using little-endian format
+MAX_UNSIGNED_LONG = 2 ** 64 - 1
+PACK_DOUBLE = '<d'
+PACK_LONG_LONG = '<q'
 
 
 class _Array(object):
@@ -117,7 +129,7 @@ class _Array(object):
             numpy.dtype(json['dtype']),
             json['shape'],
             json['order'],
-            json['bytes_len'],
+            json['data_bytes_len'],
         )
 
     def _to_json(self):
@@ -125,10 +137,10 @@ class _Array(object):
             'name': self._name,
             'record_offset': self._record_offset,
             'data_offset': self._data_offset,
+            'data_bytes_len': self._bytes_len,
             'dtype': self._dtype.str,
             'order': self._order,
             'shape': self._shape,
-            'bytes_len': self._bytes_len,
         }
 
     def read_numpy(self):
@@ -181,6 +193,9 @@ class _Group(object):
         return self._name
 
     def create_array(self, array_name, data):
+        '''
+        :param text_type array_name:
+        '''
         array = self._hbinseek._write_array(self._name, array_name, data)
         self._arrays[array_name] = array
 
@@ -188,9 +203,11 @@ class _Group(object):
         return self._arrays[array_name]
 
     def set_attr(self, attr_name, value):
+        assert isinstance(attr_name, text_type)
         if not isinstance(value, VALID_ATTR_TYPES):
             raise ValueError('Unexpected type for %s: %s' %
                              (attr_name, type(value),))
+        self._hbinseek._write_set_attr(self._name, attr_name, value)
         self._attrs[attr_name] = value
 
     def list_attrs(self):
@@ -203,6 +220,7 @@ class _Group(object):
         return self._attrs[attr_name]
 
     def create_group(self, group_name):
+        assert isinstance(group_name, text_type)
         if '/' in group_name:
             raise ValueError(
                 'Not expecting "/" to be in the group name: %s' % (group_name,))
@@ -246,17 +264,37 @@ class _Group(object):
 
 class _HBinseek(object):
 
-    def __init__(self, filename, mode='r', binary_data_filename=None, log_filename=None, autoflush=True):
+    def __init__(self, filename, mode='r', binary_data_filename=None, log_filename=None, autoflush=True, write_metadata=True):
         '''
-        :param mode:
+        :param text_type mode:
             r = read-only (no write)
             w = write (no read available)
+
+        :param bool write_metadata:
+            Whether to write the metadata (only applicable when mode == 'w') -- otherwise it has
+            to be reconstructed from the log file.
         '''
+        import os
+        assert filename.__class__ == text_type
+        assert mode.__class__ == text_type
+
         if binary_data_filename is None:
-            binary_data_filename = filename + '.hbinseekbin'
+            binary_data_filename = os.path.splitext(filename)[0] + '.hdat'
+        else:
+            assert binary_data_filename.__class__ == binary_data_filename
 
         if log_filename is None:
-            log_filename = filename + '.hbinseeklog'
+            log_filename = os.path.splitext(filename)[0] + '.hlog'
+        else:
+            assert log_filename.__class__ == binary_data_filename
+
+        assert binary_data_filename != filename
+        assert log_filename != filename
+        assert binary_data_filename != log_filename
+
+        self._filename = filename
+        self._log_filename = log_filename
+        self._binary_data_filename = binary_data_filename
 
         if mode not in ('r', 'w'):
             raise ValueError(
@@ -265,7 +303,6 @@ class _HBinseek(object):
         self._mode = mode
 
         if mode == 'r':
-            import os
             if not os.path.exists(filename) and not os.path.exists(log_filename):
                 raise OSError(
                     'Unable to open for read file which does not exist: %s' % (filename,))
@@ -275,8 +312,10 @@ class _HBinseek(object):
         self._binary_stream = file(binary_data_filename, mode + 'b')
         self._log_stream = file(log_filename, mode + 'b')
         self._autoflush = autoflush
+        self._write_metadata = write_metadata
         self._metadata_filename = filename
         self._loaded_info = False
+        self._dirty = False
 
         if self._mode == 'r':
             self._load_metadata()
@@ -284,6 +323,33 @@ class _HBinseek(object):
         if self._mode == 'w':
             # Header: filetype and version
             self._binary_stream.write(b'%BINSEEK v001\n')
+            self._log_stream.write(b'%BINSEEKLOG v001\n')
+
+            if autoflush:
+                self._binary_stream.flush()
+                self._log_stream.flush()
+            else:
+                self._dirty = True
+
+    @property
+    def filename(self):
+        return self._filename
+
+    @property
+    def log_filename(self):
+        return self._log_filename
+
+    @property
+    def binary_data_filename(self):
+        return self._binary_data_filename
+
+    @property
+    def write_metadata(self):
+        return self._write_metadata
+
+    @property
+    def dirty(self):
+        return self._dirty
 
     @property
     def mode(self):
@@ -322,9 +388,13 @@ class _HBinseek(object):
                 'Unable to write when not in write mode. Current mode: %s' % (self._mode,))
 
     def create_array(self, group_name, array_name, data):
+        assert array_name.__class__ == text_type
+        assert group_name.__class__ == text_type
+
         self.create_group(group_name).create_array(array_name, data)
 
     def create_group(self, group_name):
+        assert group_name.__class__ == text_type
         if not group_name:
             raise ValueError('Group name must be given.')
 
@@ -344,48 +414,103 @@ class _HBinseek(object):
             full_path += '/'
         return group
 
+    def _write_set_attr(self, group_name, attr_name, attr_value):
+        import struct
+        assert attr_name.__class__ == text_type
+        assert group_name.__class__ == text_type
+
+        to_log = []
+        to_log.append(b'ATTR:')
+
+        attr_name_bytes = attr_name.encode('utf-8')
+        group_name_bytes = group_name.encode('utf-8')
+
+        # long with group name size and group size
+        to_log.append(struct.pack(PACK_UNSIGNED_LONG, len(group_name_bytes)))
+        to_log.append(group_name_bytes)
+        to_log.append(b':')
+
+        # long with array name size and array size
+        to_log.append(struct.pack(PACK_UNSIGNED_LONG, len(attr_name_bytes)))
+        to_log.append(attr_name_bytes)
+        to_log.append(b':')
+
+        if attr_value.__class__ == text_type:
+            to_log.append(b'text:')
+            as_bytes = attr_value.encode('utf-8')
+
+            # If this limit is reached, we may need to create a different type
+            assert len(as_bytes) <= MAX_UNSIGNED_LONG
+
+            to_log.append(struct.pack(PACK_UNSIGNED_LONG, len(as_bytes)))
+            to_log.append(as_bytes)
+
+        elif attr_value.__class__ == bytes:
+            to_log.append(b'byte:')
+
+            # If this limit is reached, we may need to create a different type
+            assert len(attr_value) <= MAX_UNSIGNED_LONG
+
+            to_log.append(struct.pack(PACK_UNSIGNED_LONG, len(attr_value)))
+            to_log.append(attr_value)
+
+        elif isinstance(attr_value, float):
+            to_log.append(b'doub:')
+            to_log.append(struct.pack(PACK_DOUBLE, attr_value))
+
+        elif not PY3_ONWARDS and isinstance(attr_value, (int, long)):
+            # int or long is considered as long in the format
+            to_log.append(b'long:')
+            to_log.append(struct.pack(PACK_LONG_LONG, attr_value))
+
     def _write_array(self, group_name, array_name, data):
         import struct
         self._check_writable()
 
-        if PY3_ONWARDS:
-            assert type(array_name) == str
-            assert type(group_name) == str
-
-        else:
-            assert type(array_name) == bytes
-            assert type(group_name) == bytes
+        assert array_name.__class__ == text_type
+        assert group_name.__class__ == text_type
 
         array_name_bytes = array_name.encode('utf-8')
+        group_name_bytes = group_name.encode('utf-8')
 
         # Internally always save in C order.
         data_as_bytes = data.tobytes('C')
 
+        # If this limit is reached, we may need to create a different
+        # representation (as we can't pack sizes with unsigned long).
+        assert len(data_as_bytes) <= MAX_UNSIGNED_LONG
+
         binary_stream = self._binary_stream
-        log_stream = self._log_stream
 
         curr_offset = binary_stream.tell()
 
         to_log = []
-        to_log.append(b'ARRAY:')
+        to_log.append(b'ARR:')
+
+        # long with group name size and group size
+        to_log.append(struct.pack(PACK_UNSIGNED_LONG, len(group_name_bytes)))
+        to_log.append(group_name_bytes)
+        to_log.append(b':')
 
         # long with array name size and array size
-        to_log.append(struct.pack('l', len(array_name_bytes)))
+        to_log.append(struct.pack(PACK_UNSIGNED_LONG, len(array_name_bytes)))
         to_log.append(array_name_bytes)
         to_log.append(b':')
 
         # long (number of bytes of the data)
-        to_log.append(struct.pack('l', len(data_as_bytes)))
+        to_log.append(struct.pack(PACK_UNSIGNED_LONG, len(data_as_bytes)))
         to_log.append(b':')
 
+        # long with dtypes representation len and dtypes representation
         dtype_bytes = data.dtype.str.encode('ascii')
-        to_log.append(struct.pack('l', len(dtype_bytes)))
+        to_log.append(struct.pack(PACK_UNSIGNED_LONG, len(dtype_bytes)))
         to_log.append(dtype_bytes)
         to_log.append(b':')
 
-        to_log.append(struct.pack('l', len(data.shape)))
+        # long with dimension and actual size in each dimension
+        to_log.append(struct.pack(PACK_UNSIGNED_LONG, len(data.shape)))
         for i in data.shape:
-            to_log.append(struct.pack('l', i))
+            to_log.append(struct.pack(PACK_UNSIGNED_LONG, i))
         to_log.append(b':')
 
         # C or Fortran order
@@ -398,20 +523,21 @@ class _HBinseek(object):
         # offset to record start
         record_start = b''.join(to_log)
 
+        binary_stream.write(record_start)
+        binary_stream.write(data_as_bytes)
+
+        if self._autoflush:
+            binary_stream.flush()
+
+        log_stream = self._log_stream
         log_stream.write(record_start)
-        log_stream.write(struct.pack('l', curr_offset))
+        log_stream.write(struct.pack(PACK_UNSIGNED_LONG, curr_offset))
 
         # end record
         log_stream.write(b'\n')
 
         if self._autoflush:
             log_stream.flush()
-
-        binary_stream.write(record_start)
-        binary_stream.write(data_as_bytes)
-
-        if self._autoflush:
-            binary_stream.flush()
 
         return _Array(
             self,
@@ -430,28 +556,59 @@ class _HBinseek(object):
     def __exit__(self, *args, **kwargs):
         self.close()
 
+    def flush(self, write_metadata=True):
+        if self._mode != 'w':
+            return
+
+        if write_metadata:
+            self._flush_metadata()
+
+        self._binary_stream.flush()
+        self._log_stream.flush()
+        self._dirty = False
+
+    def _flush_metadata(self):
+        # metadata always needs to be written as a whole
+        metadata = self._root_group._to_json()
+
+        indent = 2
+
+        import json
+        dumped = json.dumps(metadata, indent=indent)
+        if not isinstance(dumped, bytes):
+            dumped = dumped.encode('utf-8')
+
+        with file(self._metadata_filename, 'wb') as metadata_stream:
+            metadata_stream.write(dumped)
+
     def close(self):
         if self._mode == 'w':
-            metadata = self._root_group._to_json()
-
-            import json
-            dumped = json.dumps(metadata)
-            if not isinstance(dumped, bytes):
-                dumped = dumped.encode('utf-8')
-
-            with file(self._metadata_filename, 'wb') as metadata_stream:
-                metadata_stream.write(dumped)
+            if self._write_metadata:
+                self._flush_metadata()
 
         self._binary_stream.close()
         self._log_stream.close()
 
 
-def open(filename, mode='r', binary_data_filename=None, log_filename=None):
+def open(  # @ReservedAssignment
+    filename,
+    mode='r',
+    binary_data_filename=None,
+    log_filename=None,
+    autoflush=True,
+    write_metadata=True,
+):
     '''
-    :param str filename:
+    :param text_type filename:
         The name of the metadata file to be handled.
 
     :param str mode:
         The mode to open the file (w or r).
     '''
-    return _HBinseek(filename, mode, binary_data_filename, log_filename)
+    return _HBinseek(
+        filename,
+        mode,
+        binary_data_filename,
+        log_filename,
+        autoflush=autoflush,
+        write_metadata=write_metadata)
